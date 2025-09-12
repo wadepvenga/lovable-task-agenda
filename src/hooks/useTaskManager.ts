@@ -370,9 +370,14 @@ export const useTaskManager = () => {
       filtered = filtered.filter(task => task.priority === selectedPriority);
     }
 
-    // Filtro por status
+    // Filtro por status - incluir "em_andamento" quando filtro for "pendente"
     if (selectedStatus !== 'all') {
-      filtered = filtered.filter(task => task.status === selectedStatus);
+      if (selectedStatus === 'pendente') {
+        // Pendente inclui também tarefas em andamento para não perdê-las de vista
+        filtered = filtered.filter(task => task.status === 'pendente' || task.status === 'em_andamento');
+      } else {
+        filtered = filtered.filter(task => task.status === selectedStatus);
+      }
     }
 
     setFilteredTasks(filtered);

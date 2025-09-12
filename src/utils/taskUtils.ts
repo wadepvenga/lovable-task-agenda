@@ -10,9 +10,9 @@ export const isTaskOverdue = (task: { due_date?: string; status: string }) => {
 };
 
 export const getStatusColor = (status: string, task?: { due_date?: string; status: string }) => {
-  // Se a tarefa está atrasada, sempre mostrar em vermelho
-  if (task && isTaskOverdue(task)) {
-    return 'dark:bg-red-500/20 dark:text-red-400 dark:border-red-500/30 bg-red-500 text-white border-red-600';
+  // Se a tarefa está atrasada E é pendente, mostrar como atrasada
+  if (task && isTaskOverdue(task) && status === 'pendente') {
+    return 'dark:bg-orange-500/20 dark:text-orange-400 dark:border-orange-500/30 bg-orange-500 text-white border-orange-600';
   }
 
   switch (status) {
@@ -26,16 +26,16 @@ export const getStatusColor = (status: string, task?: { due_date?: string; statu
 
 export const getPriorityColor = (priority: string) => {
   switch (priority) {
-    case 'baixa': return 'dark:bg-blue-500/20 dark:text-blue-400 dark:border-blue-500/30 bg-blue-500 text-white border-blue-600';
-    case 'media': return 'dark:bg-orange-500/20 dark:text-orange-400 dark:border-orange-500/30 bg-orange-500 text-white border-orange-600';
+    case 'baixa': return 'dark:bg-sky-500/20 dark:text-sky-400 dark:border-sky-500/30 bg-sky-400 text-white border-sky-500';
+    case 'media': return 'dark:bg-purple-500/20 dark:text-purple-400 dark:border-purple-500/30 bg-purple-500 text-white border-purple-600';
     case 'urgente': return 'dark:bg-red-600/20 dark:text-red-500 dark:border-red-600/30 bg-red-600 text-white border-red-700';
     default: return 'dark:bg-gray-500/20 dark:text-gray-400 dark:border-gray-500/30 bg-gray-400 text-black border-gray-500';
   }
 };
 
 export const getStatusLabel = (status: string, task?: { due_date?: string; status: string }) => {
-  // Se a tarefa está atrasada, sempre mostrar "Atrasada"
-  if (task && isTaskOverdue(task)) {
+  // Se a tarefa está atrasada E é pendente, mostrar "Atrasada"
+  if (task && isTaskOverdue(task) && status === 'pendente') {
     return 'Atrasada';
   }
 
