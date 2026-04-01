@@ -784,7 +784,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const authUserId = userProfile?.user_id || userId;
 
       const { data, error } = await supabase.functions.invoke('change-user-password', {
-        body: { userId: authUserId, newPassword }
+        body: { userId: authUserId, newPassword },
+        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
       if (error || !data?.success) {
@@ -824,7 +825,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const authUserId = userProfile?.user_id || userId;
 
       const { data, error } = await supabase.functions.invoke('delete-user', {
-        body: { userId: authUserId }
+        body: { userId: authUserId },
+        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
       if (error) {
