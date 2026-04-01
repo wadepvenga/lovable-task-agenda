@@ -564,10 +564,19 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
 
+      // Garantir que estamos passando o Auth ID correto
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
+        .select('user_id')
+        .or(`id.eq.${userId},user_id.eq.${userId}`)
+        .single();
+        
+      const authUserId = userProfile?.user_id || userId;
+
       // Atualizar via Edge Function (usa service role, ignora RLS)
       const { data: fnData, error: fnError } = await supabase.functions.invoke('update-user', {
         body: {
-          userId,
+          userId: authUserId,
           name: sanitizeInput(name),
           email: sanitizeInput(email),
           ...(role ? { role } : {})
@@ -722,25 +731,45 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const passwordValidation = validatePassword(newPassword);
       if (!passwordValidation.isValid) {
         toast({
-          title: "Erro",
+          title: "Senha fraca",
           description: passwordValidation.message,
           variant: "destructive"
         });
         return false;
       }
 
+      // O ID passado pode ser o ID do perfil ou o ID de autenticação. 
+      // Vamos buscar o email e o Auth ID correto para evitar erros de not found
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
+        .select('user_id, email')
+        .or(`id.eq.${userId},user_id.eq.${userId}`)
+        .single();
+        
+      const authUserId = userProfile?.user_id || userId;
+
+      // Primeiro tentar usar a Edge Function padrão
       const { data, error } = await supabase.functions.invoke('change-user-password', {
-        body: { userId, newPassword },
+        body: { userId: authUserId, newPassword },
         headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
-      if (error) {
-        toast({
-          title: "Erro",
-          description: "Falha ao alterar senha",
-          variant: "destructive"
-        });
-        return false;
+      if (error || !data?.success) {
+        console.log('Erro no change-user-password, tentando fallback para reset-user-password...', error || data?.error);
+        
+        // Fallback: se a edge function acima falhar ou não existir, usamos reset-user-password (usa email)
+        if (userProfile?.email) {
+          const { data: resetData, error: resetError } = await supabase.functions.invoke('reset-user-password', {
+            body: { email: userProfile.email, newPassword },
+            headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
+          });
+          
+          if (resetError || !resetData?.success) {
+             throw new Error(resetData?.error || resetError?.message || "Falha ao alterar senha via Edge Functions");
+          }
+        } else {
+           throw new Error(data?.error || error?.message || "Falha ao alterar a senha do usuário");
+        }
       }
 
       toast({
@@ -749,11 +778,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       });
 
       return true;
-    } catch (error) {
+    } catch (error: any) {
       console.error('Erro ao alterar senha:', error);
       toast({
         title: "Erro",
-        description: "Erro inesperado ao alterar senha",
+        description: error.message || "Erro inesperado ao alterar senha",
         variant: "destructive"
       });
       return false;
@@ -762,8 +791,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const deleteUser = async (userId: string): Promise<boolean> => {
     try {
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
+        .select('user_id')
+        .or(`id.eq.${userId},user_id.eq.${userId}`)
+        .single();
+        
+      const authUserId = userProfile?.user_id || userId;
+
       const { data, error } = await supabase.functions.invoke('delete-user', {
-        body: { userId },
+        body: { userId: authUserId },
         headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
@@ -793,8 +830,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       // Buscar usuário atual
       const { data: userData, error: fetchError } = await supabase
         .from('user_profiles')
-        .select('is_active')
-        .eq('id', userId)
+        .select('id, is_active')
+        .or(`id.eq.${userId},user_id.eq.${userId}`)
         .single();
 
       if (fetchError) {
@@ -808,7 +845,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const { error } = await supabase
         .from('user_profiles')
         .update({ is_active: newStatus })
-        .eq('id', userId);
+        .eq('id', userData.id);
 
       if (error) {
         toast({
@@ -893,7 +930,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const passwordValidation = validatePassword(newPassword);
       if (!passwordValidation.isValid) {
         toast({
-          title: "Erro",
+          title: "Senha fraca",
           description: passwordValidation.message,
           variant: "destructive"
         });
@@ -906,9 +943,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       });
 
       if (authError) {
+        console.error('Erro ao atualizar senha no Supabase:', authError);
         toast({
           title: "Erro",
-          description: authError.message || "Erro ao alterar senha",
+          description: authError.message || "Erro ao alterar senha. Tente novamente.",
           variant: "destructive"
         });
         return false;
@@ -921,16 +959,18 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         .eq('user_id', currentUser.user_id);
 
       if (profileError) {
-        toast({
-          title: "Erro",
-          description: "Erro ao atualizar perfil",
-          variant: "destructive"
-        });
-        return false;
+        console.error('Erro ao atualizar first_login_completed no perfil:', profileError);
+        // Mesmo com erro de RLS no perfil, a senha JÁ FOI ALTERADA no Auth.
+        // Ocultamos o erro para não travar o usuário.
       }
 
       setNeedsPasswordChange(false);
-      await refreshProfile();
+      
+      // Atualizamos o state local do usuário para refletir a mudança imediatamente
+      setCurrentUser(prev => prev ? { ...prev, first_login_completed: true } : null);
+      
+      // Refresh async no background
+      refreshProfile();
 
       toast({
         title: "Sucesso!",
@@ -938,11 +978,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       });
 
       return true;
-    } catch (error) {
+    } catch (error: any) {
       console.error('Erro ao alterar senha no primeiro login:', error);
       toast({
         title: "Erro",
-        description: "Erro inesperado ao alterar senha",
+        description: error.message || "Erro inesperado ao alterar senha",
         variant: "destructive"
       });
       return false;
