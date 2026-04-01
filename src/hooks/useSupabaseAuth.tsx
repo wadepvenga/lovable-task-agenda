@@ -42,6 +42,7 @@ interface AuthContextType {
   updateUser: (userId: string, userData: { name: string; email: string; role?: User['role'] }) => Promise<boolean>;
   hasPermission: (requiredRole: User['role']) => boolean;
   canAccessUserManagement: () => boolean;
+  canEditTaskDueDate: () => boolean;
   getAllUsers: () => Promise<User[]>;
   getVisibleUsers: () => Promise<User[]>;
   refreshProfile: () => Promise<void>;
@@ -256,6 +257,36 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           variant: "destructive"
         });
         return false;
+      }
+
+      // ✅ VERIFICAR SE USUÁRIO ESTÁ ATIVO
+      if (data.user) {
+        const { data: profileData, error: profileError } = await supabase
+          .from('user_profiles')
+          .select('is_active')
+          .eq('user_id', data.user.id)
+          .single();
+
+        if (profileError) {
+          console.error('Erro ao verificar status do usuário:', profileError);
+          toast({
+            title: "Erro no Login",
+            description: "Erro ao verificar status da conta. Tente novamente.",
+            variant: "destructive"
+          });
+          return false;
+        }
+
+        if (profileData && profileData.is_active === false) {
+          // 🔒 USUÁRIO DESATIVADO - Fazer logout e mostrar erro
+          await supabase.auth.signOut();
+          toast({
+            title: "Conta Desativada",
+            description: "Sua conta foi desativada. Entre em contato com o administrador.",
+            variant: "destructive"
+          });
+          return false;
+        }
       }
 
       return true;
@@ -796,6 +827,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         });
         return false;
       }
+
+      // ✅ Como o administrador definiu uma senha manualmente, 
+      // vamos remover a trava de "Primeiro Acesso" para esse usuário.
+      await supabase
+        .from('user_profiles')
+        .update({ first_login_completed: true } as any)
+        .eq('user_id', authUserId);
 
       toast({
         title: "Sucesso",
