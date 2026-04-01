@@ -370,24 +370,18 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   /**
    * ✨ FUNÇÃO PRINCIPAL - CRIAR USUÁRIO
-   * 
-   * Esta função implementa o fluxo completo de criação de usuários:
-   * 1. Valida os dados de entrada
-   * 2. Gera senha temporária segura
-   * 3. Cria usuário no Supabase Auth
-   * 4. Preserva a sessão do administrador
-   * 5. Cria/atualiza perfil no banco
-   * 6. Envia email via EmailJS
-   * 
+   *
+   * Usa a Edge Function create-user que emprega o Admin API do Supabase.
+   * Vantagens sobre signUp():
+   * - Confirma o email automaticamente (email_confirm: true)
+   * - Não afeta a sessão do administrador
+   * - Usa service role key no servidor, sem expor no cliente
+   *
    * @param userData - Dados do usuário (nome, email, papel)
    * @returns Promise<boolean> - true se criado com sucesso
    */
   const createUser = async (userData: { name: string; email: string; role: User['role'] }): Promise<boolean> => {
     try {
-      // 🔒 PROTEÇÃO: Sinalizar que estamos criando usuário para evitar interferência na sessão
-      setIsCreatingUser(true);
-      
-      // ✅ VALIDAÇÕES: Verificar se dados de entrada são válidos
       if (!validateEmail(userData.email)) {
         toast({
           title: "Erro",
@@ -399,118 +393,34 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       if (!validateName(userData.name)) {
         toast({
-          title: "Erro",  
+          title: "Erro",
           description: "Nome deve ter entre 2 e 100 caracteres",
           variant: "destructive"
         });
         return false;
       }
 
-      // 🔐 SEGURANÇA: Gerar senha temporária de 16 caracteres
       const securePassword = generateSecurePassword();
 
-      // 💾 BACKUP: Salvar sessão atual do administrador antes de criar novo usuário
-      const currentSession = session;
-      const currentUserData = currentUser;
-
-      // 🚀 CRIAÇÃO: Criar usuário no Supabase Auth com senha temporária
-      const { data: authData, error: authError } = await supabase.auth.signUp({
-        email: sanitizeInput(userData.email),
-        password: securePassword,
-        options: {
-          emailRedirectTo: `${window.location.origin}/`,
-          data: {
-            full_name: sanitizeInput(userData.name)
-          }
+      // Criar usuário via Edge Function (Admin API, email confirmado automaticamente)
+      const { data: fnData, error: fnError } = await supabase.functions.invoke('create-user', {
+        body: {
+          name: sanitizeInput(userData.name),
+          email: sanitizeInput(userData.email),
+          role: userData.role,
+          password: securePassword
         }
       });
 
-      // 🔄 RESTAURAÇÃO: Imediatamente restaurar sessão do administrador para evitar logout
-      if (currentSession && currentSession.user) {
-        // Restaurar tokens de autenticação
-        await supabase.auth.setSession({
-          access_token: currentSession.access_token,
-          refresh_token: currentSession.refresh_token
-        });
-        
-        // Garantir que estados locais permanecem inalterados
-        setCurrentUser(currentUserData);
-        setNeedsPasswordChange(currentUserData ? !currentUserData.first_login_completed : false);
-        setSession(currentSession);
-        setAuthUser(currentSession.user);
-      }
-
-      if (authError) {
+      if (fnError || !fnData?.success) {
+        const message = fnData?.error || fnError?.message || 'Falha ao criar usuário';
         toast({
           title: "Erro",
-          description: authError.message,
+          description: message,
           variant: "destructive"
         });
         return false;
       }
-
-      if (!authData.user) {
-        toast({
-          title: "Erro",
-          description: "Falha ao criar usuário",
-          variant: "destructive"
-        });
-        return false;
-      }
-
-      // ⏳ TIMING: Aguardar para evitar problemas de timing com triggers do banco
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // 🔍 VERIFICAÇÃO: Checar se já existe perfil para evitar conflitos de chave duplicada
-      const { data: existingProfile } = await supabase
-        .from('user_profiles')
-        .select('*')
-        .eq('user_id', authData.user.id)
-        .single();
-
-      let profileError = null;
-
-      if (existingProfile) {
-        // 🔄 ATUALIZAÇÃO: Perfil já existe, apenas atualizar dados
-        console.log('🔄 Atualizando perfil existente para user_id:', authData.user.id);
-        const { error } = await supabase
-        .from('user_profiles')
-        .update({ 
-            name: sanitizeInput(userData.name),
-            email: sanitizeInput(userData.email),
-          role: userData.role,
-            is_active: true,
-            first_login_completed: false // Forçar mudança de senha no primeiro login
-          } as any)
-        .eq('user_id', authData.user.id);
-
-        profileError = error;
-      } else {
-        // ✨ CRIAÇÃO: Novo perfil, inserir todos os dados
-        console.log('✨ Criando novo perfil para user_id:', authData.user.id);
-        const { error } = await supabase
-          .from('user_profiles')
-          .insert({
-            user_id: authData.user.id,
-            name: sanitizeInput(userData.name),
-            email: sanitizeInput(userData.email),
-            role: userData.role,
-            is_active: true,
-            first_login_completed: false // Usuário deve trocar senha no primeiro acesso
-          } as any);
-        
-        profileError = error;
-      }
-
-      if (profileError) {
-        console.error('Erro ao criar/atualizar perfil:', profileError);
-          toast({
-            title: "Erro",
-            description: "Falha ao criar perfil do usuário",
-            variant: "destructive"
-          });
-          return false;
-        }
 
       // 📧 EMAIL: Enviar credenciais via EmailJS para o novo usuário
       try {
@@ -621,7 +531,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       return true;
     } catch (error) {
-      // ❌ ERRO GERAL: Capturar falhas em qualquer parte do processo
       console.error('Erro geral ao criar usuário:', error);
       toast({
         title: "Erro",
@@ -629,9 +538,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         variant: "destructive"
       });
       return false;
-    } finally {
-      // 🧹 LIMPEZA: Sempre remover flag de proteção, independente do resultado
-      setIsCreatingUser(false);
     }
   };
 
@@ -1100,41 +1006,28 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       // 📧 PREPARAR: Dados para o email
       const userData = {
-        name: userProfile.name, // ✅ Corrigido: usar 'name' em vez de 'full_name'
+        name: userProfile.name,
         email: userProfile.email,
         role: userProfile.role
       };
 
-      // 🔄 ATUALIZAR: Senha no Supabase Auth usando admin API
-      try {
-        // ⚠️ NOTA: A função RPC reset_user_password pode não estar disponível no client
-        // Em produção, seria necessário implementar via Edge Functions ou Admin API
-        
-        console.log('⚠️ Função RPC não disponível no client. Usando fallback.');
-        
-        // Como fallback, vamos apenas marcar o usuário e enviar o email
-        // Em produção, seria necessário implementar a função RPC no Supabase
-        console.log('⚠️ Fallback: Enviando email com instrução para contatar admin');
-        
-      } catch (passwordError) {
-        console.error('Erro ao atualizar senha:', passwordError);
-        
-        // Como fallback, vamos apenas marcar o usuário e enviar o email
-        // Em produção, seria necessário implementar a função RPC no Supabase
-        console.log('⚠️ Fallback: Enviando email com instrução para contatar admin');
-      }
+      // 🔄 ATUALIZAR: Senha no Supabase Auth via Edge Function (Admin API)
+      const { data: resetData, error: resetError } = await supabase.functions.invoke('reset-user-password', {
+        body: {
+          email: sanitizeInput(email),
+          newPassword: newTemporaryPassword
+        }
+      });
 
-      // 🔄 MARCAR: Usuário para trocar senha no primeiro login
-      const { error: updateProfileError } = await supabase
-        .from('user_profiles')
-        .update({ 
-          first_login_completed: false,
-          last_login: null
-        })
-        .eq('user_id', userProfile.user_id);
-
-      if (updateProfileError) {
-        console.error('Erro ao marcar usuário para trocar senha:', updateProfileError);
+      if (resetError || !resetData?.success) {
+        const message = resetData?.error || resetError?.message || 'Falha ao redefinir senha';
+        console.error('Erro ao redefinir senha:', message);
+        toast({
+          title: "Erro",
+          description: message,
+          variant: "destructive"
+        });
+        return false;
       }
 
       // 📧 ENVIAR: Email com nova senha temporária
