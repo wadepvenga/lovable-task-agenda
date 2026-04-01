@@ -409,7 +409,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           email: sanitizeInput(userData.email),
           role: userData.role,
           password: securePassword
-        }
+        },
+        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
       if (fnError || !fnData?.success) {
@@ -570,7 +571,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           name: sanitizeInput(name),
           email: sanitizeInput(email),
           ...(role ? { role } : {})
-        }
+        },
+        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
       if (fnError || !fnData?.success) {
@@ -728,7 +730,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       }
 
       const { data, error } = await supabase.functions.invoke('change-user-password', {
-        body: { userId, newPassword }
+        body: { userId, newPassword },
+        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
       if (error) {
@@ -760,7 +763,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const deleteUser = async (userId: string): Promise<boolean> => {
     try {
       const { data, error } = await supabase.functions.invoke('delete-user', {
-        body: { userId }
+        body: { userId },
+        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
       });
 
       if (error) {
