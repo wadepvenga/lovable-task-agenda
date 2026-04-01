@@ -775,14 +775,22 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
 
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
+        .select('user_id')
+        .or(`id.eq.${userId},user_id.eq.${userId}`)
+        .single();
+        
+      const authUserId = userProfile?.user_id || userId;
+
       const { data, error } = await supabase.functions.invoke('change-user-password', {
-        body: { userId, newPassword }
+        body: { userId: authUserId, newPassword }
       });
 
-      if (error) {
+      if (error || !data?.success) {
         toast({
           title: "Erro",
-          description: "Falha ao alterar senha",
+          description: data?.error || error?.message || "Falha ao alterar senha",
           variant: "destructive"
         });
         return false;
@@ -807,8 +815,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const deleteUser = async (userId: string): Promise<boolean> => {
     try {
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
+        .select('user_id')
+        .or(`id.eq.${userId},user_id.eq.${userId}`)
+        .single();
+        
+      const authUserId = userProfile?.user_id || userId;
+
       const { data, error } = await supabase.functions.invoke('delete-user', {
-        body: { userId }
+        body: { userId: authUserId }
       });
 
       if (error) {
@@ -923,16 +939,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         .eq('user_id', currentUser.user_id);
 
       if (profileError) {
-        toast({
-          title: "Erro",
-          description: "Erro ao atualizar perfil",
-          variant: "destructive"
-        });
-        return false;
+        console.error('Erro ao atualizar first_login_completed no perfil:', profileError);
       }
 
       setNeedsPasswordChange(false);
-      await refreshProfile();
+      
+      // Atualiza o estado local imediatamente para destravar a tela
+      setCurrentUser(prev => prev ? { ...prev, first_login_completed: true } : null);
+      
+      refreshProfile(); // Atualiza em background
 
       toast({
         title: "Sucesso!",

@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Lock, Eye, EyeOff, LogOut } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
 import { useSupabaseAuth } from '@/hooks/useSupabaseAuth';
 import { sanitizeInput } from '@/utils/inputValidation';
 import { APP_NAME } from '@/constants/app';
@@ -20,17 +21,26 @@ const FirstTimePasswordChange: React.FC = () => {
     confirm: false
   });
   const { firstTimePasswordChange, logout } = useSupabaseAuth();
+  const { toast } = useToast();
 
   const handlePasswordChange = async (e: React.FormEvent) => {
     e.preventDefault();
     
     if (passwordData.newPassword !== passwordData.confirmPassword) {
-      console.log('As senhas não coincidem!');
+      toast({
+        title: "Senhas não coincidem",
+        description: "Por favor, certifique-se de que a nova senha e a confirmação são iguais.",
+        variant: "destructive"
+      });
       return;
     }
 
     if (passwordData.newPassword.length < 6) {
-      console.log('A nova senha deve ter pelo menos 6 caracteres.');
+      toast({
+        title: "Senha muito curta",
+        description: "A nova senha deve ter pelo menos 6 caracteres.",
+        variant: "destructive"
+      });
       return;
     }
 
