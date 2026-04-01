@@ -543,16 +543,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const updateUser = async (userId: string, userData: { name: string; email: string; role?: User['role'] }): Promise<boolean> => {
     try {
-      // Verificar se o usuário tem permissão para editar usuários
-      if (!canAccessUserManagement()) {
-        toast({
-          title: "Erro",
-          description: "Você não tem permissão para editar usuários.",
-          variant: "destructive"
-        });
-        return false;
-      }
-
       const { name, email, role } = userData;
 
       if (!validateName(name)) {
@@ -573,27 +563,22 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
 
-      // Construir o objeto de atualização
-      const updateData: any = {
-        name: sanitizeInput(name),
-        email: sanitizeInput(email)
-      };
+      // Atualizar via Edge Function (usa service role, ignora RLS)
+      const { data: fnData, error: fnError } = await supabase.functions.invoke('update-user', {
+        body: {
+          userId,
+          name: sanitizeInput(name),
+          email: sanitizeInput(email),
+          ...(role ? { role } : {})
+        }
+      });
 
-      // Se role for fornecido, incluir na atualização
-      if (role) {
-        updateData.role = role;
-      }
-
-      const { error } = await supabase
-        .from('user_profiles')
-        .update(updateData)
-        .eq('id', userId);
-
-      if (error) {
-        console.error('Erro ao atualizar usuário:', error);
+      if (fnError || !fnData?.success) {
+        const message = fnData?.error || fnError?.message || 'Falha ao atualizar usuário';
+        console.error('Erro ao atualizar usuário:', message);
         toast({
           title: "Erro",
-          description: "Falha ao atualizar usuário",
+          description: message,
           variant: "destructive"
         });
         return false;
