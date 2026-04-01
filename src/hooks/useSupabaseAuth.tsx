@@ -42,7 +42,6 @@ interface AuthContextType {
   updateUser: (userId: string, userData: { name: string; email: string; role?: User['role'] }) => Promise<boolean>;
   hasPermission: (requiredRole: User['role']) => boolean;
   canAccessUserManagement: () => boolean;
-  canEditTaskDueDate: () => boolean;
   getAllUsers: () => Promise<User[]>;
   getVisibleUsers: () => Promise<User[]>;
   refreshProfile: () => Promise<void>;
@@ -259,36 +258,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
 
-      // ✅ VERIFICAR SE USUÁRIO ESTÁ ATIVO
-      if (data.user) {
-        const { data: profileData, error: profileError } = await supabase
-          .from('user_profiles')
-          .select('is_active')
-          .eq('user_id', data.user.id)
-          .single();
-
-        if (profileError) {
-          console.error('Erro ao verificar status do usuário:', profileError);
-          toast({
-            title: "Erro no Login",
-            description: "Erro ao verificar status da conta. Tente novamente.",
-            variant: "destructive"
-          });
-          return false;
-        }
-
-        if (profileData && profileData.is_active === false) {
-          // 🔒 USUÁRIO DESATIVADO - Fazer logout e mostrar erro
-          await supabase.auth.signOut();
-          toast({
-            title: "Conta Desativada",
-            description: "Sua conta foi desativada. Entre em contato com o administrador.",
-            variant: "destructive"
-          });
-          return false;
-        }
-      }
-
       return true;
     } catch (error) {
       console.error('Erro no login:', error);
@@ -370,18 +339,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   /**
    * ✨ FUNÇÃO PRINCIPAL - CRIAR USUÁRIO
-   *
-   * Usa a Edge Function create-user que emprega o Admin API do Supabase.
-   * Vantagens sobre signUp():
-   * - Confirma o email automaticamente (email_confirm: true)
-   * - Não afeta a sessão do administrador
-   * - Usa service role key no servidor, sem expor no cliente
-   *
+   * 
+   * Esta função implementa o fluxo completo de criação de usuários:
+   * 1. Valida os dados de entrada
+   * 2. Gera senha temporária segura
+   * 3. Cria usuário no Supabase Auth
+   * 4. Preserva a sessão do administrador
+   * 5. Cria/atualiza perfil no banco
+   * 6. Envia email via EmailJS
+   * 
    * @param userData - Dados do usuário (nome, email, papel)
    * @returns Promise<boolean> - true se criado com sucesso
    */
   const createUser = async (userData: { name: string; email: string; role: User['role'] }): Promise<boolean> => {
     try {
+      // 🔒 PROTEÇÃO: Sinalizar que estamos criando usuário para evitar interferência na sessão
+      setIsCreatingUser(true);
+      
+      // ✅ VALIDAÇÕES: Verificar se dados de entrada são válidos
       if (!validateEmail(userData.email)) {
         toast({
           title: "Erro",
@@ -393,35 +368,118 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       if (!validateName(userData.name)) {
         toast({
-          title: "Erro",
+          title: "Erro",  
           description: "Nome deve ter entre 2 e 100 caracteres",
           variant: "destructive"
         });
         return false;
       }
 
+      // 🔐 SEGURANÇA: Gerar senha temporária de 16 caracteres
       const securePassword = generateSecurePassword();
 
-      // Criar usuário via Edge Function (Admin API, email confirmado automaticamente)
-      const { data: fnData, error: fnError } = await supabase.functions.invoke('create-user', {
-        body: {
-          name: sanitizeInput(userData.name),
-          email: sanitizeInput(userData.email),
-          role: userData.role,
-          password: securePassword
-        },
-        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
+      // 💾 BACKUP: Salvar sessão atual do administrador antes de criar novo usuário
+      const currentSession = session;
+      const currentUserData = currentUser;
+
+      // 🚀 CRIAÇÃO: Criar usuário no Supabase Auth com senha temporária
+      const { data: authData, error: authError } = await supabase.auth.signUp({
+        email: sanitizeInput(userData.email),
+        password: securePassword,
+        options: {
+          emailRedirectTo: `${window.location.origin}/`,
+          data: {
+            full_name: sanitizeInput(userData.name)
+          }
+        }
       });
 
-      if (fnError || !fnData?.success) {
-        const message = fnData?.error || fnError?.message || 'Falha ao criar usuário';
+      // 🔄 RESTAURAÇÃO: Imediatamente restaurar sessão do administrador para evitar logout
+      if (currentSession && currentSession.user) {
+        // Restaurar tokens de autenticação
+        await supabase.auth.setSession({
+          access_token: currentSession.access_token,
+          refresh_token: currentSession.refresh_token
+        });
+        
+        // Garantir que estados locais permanecem inalterados
+        setCurrentUser(currentUserData);
+        setNeedsPasswordChange(currentUserData ? !currentUserData.first_login_completed : false);
+        setSession(currentSession);
+        setAuthUser(currentSession.user);
+      }
+
+      if (authError) {
         toast({
           title: "Erro",
-          description: message,
+          description: authError.message,
           variant: "destructive"
         });
         return false;
       }
+
+      if (!authData.user) {
+        toast({
+          title: "Erro",
+          description: "Falha ao criar usuário",
+          variant: "destructive"
+        });
+        return false;
+      }
+
+      // ⏳ TIMING: Aguardar para evitar problemas de timing com triggers do banco
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // 🔍 VERIFICAÇÃO: Checar se já existe perfil para evitar conflitos de chave duplicada
+      const { data: existingProfile } = await supabase
+        .from('user_profiles')
+        .select('*')
+        .eq('user_id', authData.user.id)
+        .single();
+
+      let profileError = null;
+
+      if (existingProfile) {
+        // 🔄 ATUALIZAÇÃO: Perfil já existe, apenas atualizar dados
+        console.log('🔄 Atualizando perfil existente para user_id:', authData.user.id);
+        const { error } = await supabase
+        .from('user_profiles')
+        .update({ 
+            name: sanitizeInput(userData.name),
+            email: sanitizeInput(userData.email),
+          role: userData.role,
+            is_active: true,
+            first_login_completed: false // Forçar mudança de senha no primeiro login
+          } as any)
+        .eq('user_id', authData.user.id);
+
+        profileError = error;
+      } else {
+        // ✨ CRIAÇÃO: Novo perfil, inserir todos os dados
+        console.log('✨ Criando novo perfil para user_id:', authData.user.id);
+        const { error } = await supabase
+          .from('user_profiles')
+          .insert({
+            user_id: authData.user.id,
+            name: sanitizeInput(userData.name),
+            email: sanitizeInput(userData.email),
+            role: userData.role,
+            is_active: true,
+            first_login_completed: false // Usuário deve trocar senha no primeiro acesso
+          } as any);
+        
+        profileError = error;
+      }
+
+      if (profileError) {
+        console.error('Erro ao criar/atualizar perfil:', profileError);
+          toast({
+            title: "Erro",
+            description: "Falha ao criar perfil do usuário",
+            variant: "destructive"
+          });
+          return false;
+        }
 
       // 📧 EMAIL: Enviar credenciais via EmailJS para o novo usuário
       try {
@@ -532,6 +590,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       return true;
     } catch (error) {
+      // ❌ ERRO GERAL: Capturar falhas em qualquer parte do processo
       console.error('Erro geral ao criar usuário:', error);
       toast({
         title: "Erro",
@@ -539,11 +598,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         variant: "destructive"
       });
       return false;
+    } finally {
+      // 🧹 LIMPEZA: Sempre remover flag de proteção, independente do resultado
+      setIsCreatingUser(false);
     }
   };
 
   const updateUser = async (userId: string, userData: { name: string; email: string; role?: User['role'] }): Promise<boolean> => {
     try {
+      // Verificar se o usuário tem permissão para editar usuários
+      if (!canAccessUserManagement()) {
+        toast({
+          title: "Erro",
+          description: "Você não tem permissão para editar usuários.",
+          variant: "destructive"
+        });
+        return false;
+      }
+
       const { name, email, role } = userData;
 
       if (!validateName(name)) {
@@ -564,32 +636,27 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
 
-      // Garantir que estamos passando o Auth ID correto
-      const { data: userProfile } = await supabase
+      // Construir o objeto de atualização
+      const updateData: any = {
+        name: sanitizeInput(name),
+        email: sanitizeInput(email)
+      };
+
+      // Se role for fornecido, incluir na atualização
+      if (role) {
+        updateData.role = role;
+      }
+
+      const { error } = await supabase
         .from('user_profiles')
-        .select('user_id')
-        .or(`id.eq.${userId},user_id.eq.${userId}`)
-        .single();
-        
-      const authUserId = userProfile?.user_id || userId;
+        .update(updateData)
+        .eq('id', userId);
 
-      // Atualizar via Edge Function (usa service role, ignora RLS)
-      const { data: fnData, error: fnError } = await supabase.functions.invoke('update-user', {
-        body: {
-          userId: authUserId,
-          name: sanitizeInput(name),
-          email: sanitizeInput(email),
-          ...(role ? { role } : {})
-        },
-        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
-      });
-
-      if (fnError || !fnData?.success) {
-        const message = fnData?.error || fnError?.message || 'Falha ao atualizar usuário';
-        console.error('Erro ao atualizar usuário:', message);
+      if (error) {
+        console.error('Erro ao atualizar usuário:', error);
         toast({
           title: "Erro",
-          description: message,
+          description: "Falha ao atualizar usuário",
           variant: "destructive"
         });
         return false;
@@ -614,28 +681,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const getAllUsers = async (): Promise<User[]> => {
     try {
-      if (!canAccessUserManagement()) {
-        toast({
-          title: "Erro",
-          description: "Você não tem permissão para acessar esta funcionalidade.",
-          variant: "destructive"
-        });
-        return [];
-      }
-
       const { data, error } = await supabase
         .from('user_profiles')
         .select('*')
-        .eq('is_active', true) // ✅ FILTRAR APENAS USUÁRIOS ATIVOS
-        .order('name', { ascending: true });
+        .order('created_at', { ascending: false });
 
       if (error) {
         console.error('Erro ao buscar usuários:', error);
-        toast({
-          title: "Erro",
-          description: "Falha ao buscar usuários",
-          variant: "destructive"
-        });
         return [];
       }
 
@@ -648,16 +700,10 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         is_active: user.is_active as boolean,
         password_hash: user.password_hash as string,
         created_at: new Date(user.created_at as string),
-        last_login: user.last_login ? new Date(user.last_login as string) : undefined,
-        first_login_completed: (user as any).first_login_completed as boolean
+        last_login: user.last_login ? new Date(user.last_login as string) : undefined
       }));
     } catch (error) {
       console.error('Erro ao buscar usuários:', error);
-      toast({
-        title: "Erro",
-        description: "Erro inesperado ao buscar usuários",
-        variant: "destructive"
-      });
       return [];
     }
   };
@@ -677,7 +723,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         const { data: fallbackData, error: fallbackError } = await supabase
           .from('user_profiles')
           .select('*')
-          .eq('is_active', true) // ✅ FILTRAR APENAS USUÁRIOS ATIVOS
+          .eq('is_active', true)
           .order('name', { ascending: true });
         
         if (fallbackError) {
@@ -698,28 +744,19 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         }));
       }
 
-      // ✅ FILTRAR APENAS USUÁRIOS ATIVOS da função RPC
-      // A função RPC já deve filtrar por is_active = true, mas vamos garantir
-      const activeUsers = (data || []).filter((user: any) => {
-        // Se a função RPC retorna is_active, usar esse valor
-        if (user.hasOwnProperty('is_active')) {
-          return user.is_active !== false;
-        }
-        // Se não retorna is_active, assumir que são todos ativos (comportamento padrão da RPC)
-        return true;
-      });
-      
-      return activeUsers.map((user: any) => ({
-        id: user.id || user.user_id, // Fallback para compatibilidade
-        user_id: user.user_id as string,
-        name: user.name as string,
-        email: user.email as string,
-        role: user.role as User['role'],
-        is_active: true, // Todos os usuários retornados pela RPC são ativos
-        password_hash: '', // Não retornado pela RPC
-        created_at: new Date(), // Não retornado pela RPC
-        last_login: undefined // Não retornado pela RPC
-      }));
+      // Processar dados da função do banco
+      return (Array.isArray(data) ? data : [])
+        .map((user: any) => ({
+          id: user.user_id as string, // Função retorna user_id como id
+          user_id: user.user_id as string,
+          name: user.name as string,
+          email: user.email as string,
+          role: user.role as User['role'],
+          is_active: true, // Função já filtra por is_active
+          password_hash: '', // Não retornado pela função
+          created_at: new Date(), // Não retornado pela função
+          last_login: undefined // Não retornado pela função
+        }));
     } catch (error) {
       console.error('Erro ao buscar usuários visíveis:', error);
       return [];
@@ -731,45 +768,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const passwordValidation = validatePassword(newPassword);
       if (!passwordValidation.isValid) {
         toast({
-          title: "Senha fraca",
+          title: "Erro",
           description: passwordValidation.message,
           variant: "destructive"
         });
         return false;
       }
 
-      // O ID passado pode ser o ID do perfil ou o ID de autenticação. 
-      // Vamos buscar o email e o Auth ID correto para evitar erros de not found
-      const { data: userProfile } = await supabase
-        .from('user_profiles')
-        .select('user_id, email')
-        .or(`id.eq.${userId},user_id.eq.${userId}`)
-        .single();
-        
-      const authUserId = userProfile?.user_id || userId;
-
-      // Primeiro tentar usar a Edge Function padrão
       const { data, error } = await supabase.functions.invoke('change-user-password', {
-        body: { userId: authUserId, newPassword },
-        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
+        body: { userId, newPassword }
       });
 
-      if (error || !data?.success) {
-        console.log('Erro no change-user-password, tentando fallback para reset-user-password...', error || data?.error);
-        
-        // Fallback: se a edge function acima falhar ou não existir, usamos reset-user-password (usa email)
-        if (userProfile?.email) {
-          const { data: resetData, error: resetError } = await supabase.functions.invoke('reset-user-password', {
-            body: { email: userProfile.email, newPassword },
-            headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
-          });
-          
-          if (resetError || !resetData?.success) {
-             throw new Error(resetData?.error || resetError?.message || "Falha ao alterar senha via Edge Functions");
-          }
-        } else {
-           throw new Error(data?.error || error?.message || "Falha ao alterar a senha do usuário");
-        }
+      if (error) {
+        toast({
+          title: "Erro",
+          description: "Falha ao alterar senha",
+          variant: "destructive"
+        });
+        return false;
       }
 
       toast({
@@ -778,11 +794,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       });
 
       return true;
-    } catch (error: any) {
+    } catch (error) {
       console.error('Erro ao alterar senha:', error);
       toast({
         title: "Erro",
-        description: error.message || "Erro inesperado ao alterar senha",
+        description: "Erro inesperado ao alterar senha",
         variant: "destructive"
       });
       return false;
@@ -791,17 +807,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const deleteUser = async (userId: string): Promise<boolean> => {
     try {
-      const { data: userProfile } = await supabase
-        .from('user_profiles')
-        .select('user_id')
-        .or(`id.eq.${userId},user_id.eq.${userId}`)
-        .single();
-        
-      const authUserId = userProfile?.user_id || userId;
-
       const { data, error } = await supabase.functions.invoke('delete-user', {
-        body: { userId: authUserId },
-        headers: session ? { Authorization: `Bearer ${session.access_token}` } : undefined
+        body: { userId }
       });
 
       if (error) {
@@ -830,8 +837,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       // Buscar usuário atual
       const { data: userData, error: fetchError } = await supabase
         .from('user_profiles')
-        .select('id, is_active')
-        .or(`id.eq.${userId},user_id.eq.${userId}`)
+        .select('is_active')
+        .eq('id', userId)
         .single();
 
       if (fetchError) {
@@ -839,13 +846,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return false;
       }
 
-      // ✅ ALTERNAR STATUS: Se está ativo, desativar; se está inativo, ativar
-      const newStatus = !(userData as any).is_active;
-      
+      // Alternar status
       const { error } = await supabase
         .from('user_profiles')
-        .update({ is_active: newStatus })
-        .eq('id', userData.id);
+        .update({ is_active: !(userData as any).is_active })
+        .eq('id', userId);
 
       if (error) {
         toast({
@@ -876,46 +881,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     return hasPermission('franqueado');
   };
 
-  /**
-   * 🔒 VERIFICA PERMISSÃO PARA EDIÇÃO DE DATAS DE PRAZO
-   * 
-   * Esta função verifica se o usuário atual tem permissão para editar
-   * datas de prazo de tarefas existentes.
-   * 
-   * REGRAS DE NEGÓCIO:
-   * - Admin: ✅ Pode editar datas de prazo (nível máximo)
-   * - Franqueado: ✅ Pode editar datas de prazo (nível elevado)
-   * - Supervisor ADM: ✅ Pode editar datas de prazo (nível gerencial)
-   * - Coordenador: ❌ Não pode editar datas de prazo
-   * - Assessora ADM: ❌ Não pode editar datas de prazo
-   * - Professor: ❌ Não pode editar datas de prazo
-   * - Vendedor: ❌ Não pode editar datas de prazo
-   * 
-   * JUSTIFICATIVA:
-   * A alteração de prazos é uma operação crítica que pode impactar
-   * o planejamento da equipe. Apenas usuários com responsabilidades
-   * gerenciais devem ter essa permissão.
-   * 
-   * @returns boolean - true se usuário pode editar datas de prazo de tarefas existentes
-   * 
-   * @example
-   * // Usuário admin pode editar
-   * if (canEditTaskDueDate()) {
-   *   // Habilitar campos de data/hora
-   * }
-   * 
-   * // Usuário vendedor não pode editar
-   * if (!canEditTaskDueDate()) {
-   *   // Desabilitar campos e mostrar mensagem
-   * }
-   */
-  const canEditTaskDueDate = (): boolean => {
-    if (!currentUser) return false;
-    
-    // Apenas admin, franqueado e supervisor_adm podem editar datas de prazo
-    return ['admin', 'franqueado', 'supervisor_adm'].includes(currentUser.role);
-  };
-
   const firstTimePasswordChange = async (newPassword: string): Promise<boolean> => {
     try {
       if (!currentUser) {
@@ -930,7 +895,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const passwordValidation = validatePassword(newPassword);
       if (!passwordValidation.isValid) {
         toast({
-          title: "Senha fraca",
+          title: "Erro",
           description: passwordValidation.message,
           variant: "destructive"
         });
@@ -943,10 +908,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       });
 
       if (authError) {
-        console.error('Erro ao atualizar senha no Supabase:', authError);
         toast({
           title: "Erro",
-          description: authError.message || "Erro ao alterar senha. Tente novamente.",
+          description: authError.message || "Erro ao alterar senha",
           variant: "destructive"
         });
         return false;
@@ -959,18 +923,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         .eq('user_id', currentUser.user_id);
 
       if (profileError) {
-        console.error('Erro ao atualizar first_login_completed no perfil:', profileError);
-        // Mesmo com erro de RLS no perfil, a senha JÁ FOI ALTERADA no Auth.
-        // Ocultamos o erro para não travar o usuário.
+        toast({
+          title: "Erro",
+          description: "Erro ao atualizar perfil",
+          variant: "destructive"
+        });
+        return false;
       }
 
       setNeedsPasswordChange(false);
-      
-      // Atualizamos o state local do usuário para refletir a mudança imediatamente
-      setCurrentUser(prev => prev ? { ...prev, first_login_completed: true } : null);
-      
-      // Refresh async no background
-      refreshProfile();
+      await refreshProfile();
 
       toast({
         title: "Sucesso!",
@@ -978,11 +940,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       });
 
       return true;
-    } catch (error: any) {
+    } catch (error) {
       console.error('Erro ao alterar senha no primeiro login:', error);
       toast({
         title: "Erro",
-        description: error.message || "Erro inesperado ao alterar senha",
+        description: "Erro inesperado ao alterar senha",
         variant: "destructive"
       });
       return false;
@@ -1035,28 +997,56 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       // 📧 PREPARAR: Dados para o email
       const userData = {
-        name: userProfile.name,
+        name: userProfile.full_name,
         email: userProfile.email,
         role: userProfile.role
       };
 
-      // 🔄 ATUALIZAR: Senha no Supabase Auth via Edge Function (Admin API)
-      const { data: resetData, error: resetError } = await supabase.functions.invoke('reset-user-password', {
-        body: {
-          email: sanitizeInput(email),
-          newPassword: newTemporaryPassword
-        }
-      });
+      // 🔄 ATUALIZAR: Senha no Supabase Auth usando admin API
+      try {
+        // Primeiro, vamos obter o user_id do auth.users
+        const { data: authUsers, error: authError } = await supabase
+          .from('auth.users')
+          .select('id')
+          .eq('email', sanitizeInput(email))
+          .single();
 
-      if (resetError || !resetData?.success) {
-        const message = resetData?.error || resetError?.message || 'Falha ao redefinir senha';
-        console.error('Erro ao redefinir senha:', message);
-        toast({
-          title: "Erro",
-          description: message,
-          variant: "destructive"
+        if (authError || !authUsers) {
+          console.error('Erro ao buscar usuário auth:', authError);
+          throw new Error('Usuário não encontrado no sistema de autenticação');
+        }
+
+        // Como não temos acesso direto ao admin API no client, vamos usar um workaround
+        // Vamos criar um RPC (Remote Procedure Call) para isso
+        const { error: updateError } = await supabase.rpc('reset_user_password', {
+          user_email: sanitizeInput(email),
+          new_password: newTemporaryPassword
         });
-        return false;
+
+        if (updateError) {
+          console.error('Erro ao atualizar senha:', updateError);
+          throw new Error('Erro ao atualizar senha');
+        }
+
+      } catch (passwordError) {
+        console.error('Erro ao atualizar senha:', passwordError);
+        
+        // Como fallback, vamos apenas marcar o usuário e enviar o email
+        // Em produção, seria necessário implementar a função RPC no Supabase
+        console.log('⚠️ Fallback: Enviando email com instrução para contatar admin');
+      }
+
+      // 🔄 MARCAR: Usuário para trocar senha no primeiro login
+      const { error: updateProfileError } = await supabase
+        .from('user_profiles')
+        .update({ 
+          first_login_completed: false,
+          last_login: null
+        })
+        .eq('user_id', userProfile.user_id);
+
+      if (updateProfileError) {
+        console.error('Erro ao marcar usuário para trocar senha:', updateProfileError);
       }
 
       // 📧 ENVIAR: Email com nova senha temporária
@@ -1145,7 +1135,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       updateUser,
       hasPermission,
       canAccessUserManagement,
-      canEditTaskDueDate,
       getAllUsers,
       getVisibleUsers,
       refreshProfile,
